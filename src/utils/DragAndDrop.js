@@ -23,7 +23,7 @@
 
 
 /*jslint vars: true, plusplus: true, devel: true, nomen: true, indent: 4, maxerr: 50 */
-/*global define, brackets, $ */
+/*global define, $, FileReader*/
 
 define(function (require, exports, module) {
     "use strict";
@@ -39,33 +39,50 @@ define(function (require, exports, module) {
         ProjectManager  = require("project/ProjectManager"),
         Strings         = require("strings"),
         StringUtils     = require("utils/StringUtils");
-    
+
+    // Bramble specific bits
+    var _               = require("thirdparty/lodash"),
+        Filer           = require("filesystem/impls/filer/BracketsFiler"),
+        Content         = require("filesystem/impls/filer/lib/content"),
+        Path            = Filer.Path;
     /**
      * Returns true if the drag and drop items contains valid drop objects.
      * @param {Array.<DataTransferItem>} items Array of items being dragged
      * @return {boolean} True if one or more items can be dropped.
      */
     function isValidDrop(items) {
-        var i, len = items.length;
-        
-        for (i = 0; i < len; i++) {
-            if (items[i].kind === "file") {
-                var entry = items[i].webkitGetAsEntry();
-                
-                if (entry.isFile) {
-                    // If any files are being dropped, this is a valid drop
-                    return true;
-                } else if (len === 1) {
-                    // If exactly one folder is being dropped, this is a valid drop
-                    return true;
-                }
-            }
-        }
-        
-        // No valid entries found
-        return false;
+        // XXXBramble: there's no cross-browser way to check the type of what
+        // is being dropped (i.e., webkitGetAsEntry()), therefore, always valid.
+        return true;
     }
-    
+
+    function _showErrorDialog(errorFiles) {
+        function errorToString(err) {
+            return FileUtils.getFileErrorString(err);
+        }
+
+        if (!errorFiles.length) {
+            return;
+        }
+
+        var message = Strings.ERROR_OPENING_FILES;
+        
+        message += "<ul class='dialog-list'>";
+        errorFiles.forEach(function (info) {
+            message += "<li><span class='dialog-filename'>" +
+                StringUtils.breakableUrl(ProjectManager.makeProjectRelativeIfPossible(info.path)) +
+                "</span> - " + errorToString(info.error) +
+                "</li>";
+        });
+        message += "</ul>";
+
+        Dialogs.showModalDialog(
+            DefaultDialogs.DIALOG_ID_ERROR,
+            Strings.ERROR_OPENING_FILE_TITLE,
+            message
+        );
+    }
+
     /**
      * Open dropped files
      * @param {Array.<string>} files Array of files dropped on the application.
@@ -120,32 +137,7 @@ define(function (require, exports, module) {
             return result.promise();
         }, false)
             .fail(function () {
-                function errorToString(err) {
-                    if (err === ERR_MULTIPLE_ITEMS_WITH_DIR) {
-                        return Strings.ERROR_MIXED_DRAGDROP;
-                    } else {
-                        return FileUtils.getFileErrorString(err);
-                    }
-                }
-
-                if (errorFiles.length > 0) {
-                    var message = Strings.ERROR_OPENING_FILES;
-                    
-                    message += "<ul class='dialog-list'>";
-                    errorFiles.forEach(function (info) {
-                        message += "<li><span class='dialog-filename'>" +
-                            StringUtils.breakableUrl(ProjectManager.makeProjectRelativeIfPossible(info.path)) +
-                            "</span> - " + errorToString(info.error) +
-                            "</li>";
-                    });
-                    message += "</ul>";
-                    
-                    Dialogs.showModalDialog(
-                        DefaultDialogs.DIALOG_ID_ERROR,
-                        Strings.ERROR_OPENING_FILE_TITLE,
-                        message
-                    );
-                }
+                _showErrorDialog(errorFiles);
             });
     }
     
@@ -155,38 +147,93 @@ define(function (require, exports, module) {
      * protects the Brackets app from being replaced by the browser trying to load the dropped file in its place.
      */
     function attachHandlers() {
-        
+
         function handleDragOver(event) {
             event = event.originalEvent || event;
-            
-            var files = event.dataTransfer.files;
-            if (files && files.length) {
-                event.stopPropagation();
-                event.preventDefault();
-                
-                var dropEffect = "none";
-                
-                // Don't allow drag-and-drop of files/folders when a modal dialog is showing.
-                if ($(".modal.instance").length === 0 && isValidDrop(event.dataTransfer.items)) {
-                    dropEffect = "copy";
-                }
-                event.dataTransfer.dropEffect = dropEffect;
-            }
+            event.stopPropagation();
+            event.preventDefault();
+
+            // Don't allow drag-and-drop of files/folders when a modal dialog is showing.
+            event.dataTransfer.dropEffect = $(".modal.instance").length === 0  ? "copy" : "none";
         }
-        
+
         function handleDrop(event) {
             event = event.originalEvent || event;
-            
-            var files = event.dataTransfer.files;
-            if (files && files.length) {
-                event.stopPropagation();
-                event.preventDefault();
-                
-                brackets.app.getDroppedFiles(function (err, paths) {
-                    if (!err) {
-                        openDroppedFiles(paths);
+            event.stopPropagation();
+            event.preventDefault();
+
+            var pathList = [];
+            var errorList = [];
+
+            function prepareDropPaths(fileList) {
+                // Convert FileList object to an Array with all *.html files at the end,
+                // since we need to write any .css, .js, etc. resources first such that
+                // Blob URLs can be generated for these resources prior to rewriting an HTML file.
+                return _.toArray(fileList).sort(function(a,b) {
+                    a = Content.isHTML(Path.extname(a.name)) ? 10 : 1;
+                    b = Content.isHTML(Path.extname(b.name)) ? 10 : 1;
+
+                    if(a < b) {
+                        return -1;
                     }
+                    if(a > b) {
+                        return 1;
+                    }
+                    return 0;
                 });
+            }
+
+            function importFile(item) {
+                var deferred = new $.Deferred();
+                var reader = new FileReader();
+
+                reader.onload = function(e) {
+                    delete reader.onload;
+
+                    var filename = Path.join('/', item.name);
+                    var file = FileSystem.getFileForPath(filename);
+
+                    // Create a Filer Buffer, and determine the proper encoding
+                    var buffer = new Filer.Buffer(e.target.result);
+                    var encoding = Content.isUTF8Encoded(Path.extname(filename)) ? 'utf8' : null;
+                    if(encoding === 'utf8') {
+                        buffer = buffer.toString();
+                    }
+
+                    file.write(buffer, {encoding: encoding}, function(err) {
+                        if (err) {
+                            deferred.reject(err);
+                            return;
+                        }
+
+                        pathList.push(filename);
+                        deferred.resolve();
+                    });
+                };
+
+                // Deal with error cases, for example, trying to drop a folder vs. file
+                reader.onerror = function(err) {
+                    delete reader.onerror;
+
+                    errorList.push({path: item.name, error: "Unable to read dropped item."});
+                    deferred.reject(err);
+                };
+
+                reader.readAsArrayBuffer(item);
+
+                return deferred.promise();
+            }
+
+            var files = event.dataTransfer.files;
+
+            if (files && files.length) {
+                Async.doSequentially(prepareDropPaths(files), importFile, false)
+                    .done(function() {
+                        openDroppedFiles(pathList);
+                    })
+                    .fail(function() {
+                        _showErrorDialog(errorList);
+                    });
             }
         }
         
